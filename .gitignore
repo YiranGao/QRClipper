@@ -1,0 +1,25 @@
+# ---- PyInstaller 构建产物 ----
+# dist/ 里的单文件 exe 约 20MB，build/ 为中间产物，均不入库
+build/
+dist/
+# *.spec 由 PyInstaller 生成，内含本机绝对路径，不入库
+*.spec
+
+# ---- Python 字节码缓存 ----
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+
+# ---- 日志 ----
+*.log
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
