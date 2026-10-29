@@ -1,3 +1,5 @@
+[简体中文](README.md) | [English](README_EN.md)
+
 # QRClipper — 屏幕二维码识别小工具
 
 一个 Windows 10 后台常驻的轻量小工具：按快捷键，识别当前屏幕上的二维码，把内容直接复制到剪贴板。
