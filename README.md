@@ -78,7 +78,8 @@ QRClipper.exe --no-tray    :: 不显示托盘图标（常驻但不占托盘）
 pip install pillow pyzbar zxing-cpp pystray
 python qrclip.py            :: 常驻模式
 python qrclip.py --selftest :: 自检
-python tests\test_smoke.py  :: 单元测试（15 项）
+python tests\test_smoke.py                              :: 冒烟测试（直接跑单个文件）
+python -m unittest tests.test_smoke tests.test_hotkey_entry  :: 非交互回归（推荐）
 python build.py             :: 用 PyInstaller 打包成 dist\QRClipper.exe
 ```
 
