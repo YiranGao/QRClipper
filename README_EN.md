@@ -27,7 +27,12 @@ A lightweight Windows 10 background utility: press a hotkey, read the QR code cu
 | `Ctrl + Alt + Q` | Full-screen scan: captures every monitor and reads any QR code it finds |
 | `Ctrl + Alt + W` | Region selection: drag to select a screen area, then read it (more accurate when several QR codes are close together) |
 
-A toast notification appears on success; on failure you'll see "No QR code found".
+> These are the **defaults**. Change them from the tray menu under "Settings…". The hotkeys
+> actually in effect are shown in the startup notice and in the tray menu labels.
+
+Every trigger always shows a bottom-right notice: "Copied to clipboard" plus a preview on
+success, "No QR code found" when the screen has none, and "Scan failed" with the reason on
+errors. See the next section.
 
 ## Bottom-right notice: is the app alive?
 
@@ -51,7 +56,8 @@ notice moves up instead of being hidden behind it.
 Right-click the tray icon:
 
 - **Full-screen scan / Region selection** — same as the hotkeys (double-clicking the icon = full-screen scan)
-- **Settings…** — change hotkeys, toggle the toast notification and the sound
+- **Settings…** — change hotkeys, toggle the notice and the sound (only success notices are
+  silenced; failures and empty results are always shown)
 - **Launch at startup** — writes `HKCU\...\Run` so the app starts with Windows
 - **Exit**
 
