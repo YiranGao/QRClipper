@@ -563,6 +563,17 @@ def run_doctor() -> int:
         emit(f"全屏截图失败    : {exc}")
 
     emit("===== 诊断结束 =====")
+
+    # 打包成 windowed 后没有控制台：报告一定要落盘，不能只靠弹窗
+    try:
+        report_path = os.path.join(config_module.app_dir(), "doctor_result.txt")
+        with open(report_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(report) + "\n")
+        emit(f"报告已写入：{report_path}")
+    except OSError as exc:
+        report_path = ""
+        emit(f"报告写入失败：{exc}")
+
     if sys.stdout is None or getattr(sys, "frozen", False):
         _show_message("QRClipper 环境诊断", "\n".join(report))
     return 0
