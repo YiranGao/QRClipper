@@ -91,8 +91,11 @@ class App:
         self.hotkeys.start()
         self.hotkeys.wait_ready()
         self._reload_hotkeys()
-        if not self.hotkeys.registered_bindings():
-            self.logger.warning("没有任何快捷键注册成功，请检查设置与其他程序占用情况")
+        # update_bindings 只是投递消息，真正的 RegisterHotKey 稍后才发生；
+        # 必须等它执行完再判断，否则每次启动都会误报"没有任何快捷键注册成功"。
+        if not self.hotkeys.wait_bindings(2.0):
+            self.logger.warning("热键重载超时，注册结果可能不完整")
+        self._check_hotkey_registration()
 
         if self.show_tray:
             self._start_tray()
@@ -131,11 +134,50 @@ class App:
                 tk_size[0], tk_size[1], physical[0], physical[1],
             )
 
+        # 在 _apply_autostart() 之后记录，因此这里是注册表里的最终状态
         autostart = bool(self.cfg.get("autostart"))
         self.logger.info(
-            "开机自启动：%s",
+            "开机自启动：%s（注册表状态：%s）",
             "已开启" if autostart else "已关闭（重启电脑后不会自动运行，需要手动启动）",
+            "已写入" if config_module.is_autostart_enabled() else "无",
         )
+
+        engines = decoder_engines()
+        if engines:
+            self.logger.info("识别引擎：%s", "、".join(name for name, _fn in engines))
+        else:
+            self.logger.warning("没有任何可用的二维码识别引擎，识别功能不可用")
+
+    def _check_hotkey_registration(self) -> None:
+        """校验热键注册结果，只在**真的**失败时才告警。
+
+        必须在 hotkeys.wait_bindings() 之后调用：否则读到的是重载前的空结果，
+        会每次启动都打一条误导性的 WARNING。
+        """
+        expected = {
+            ACTION_FULL: self.cfg.get("hotkey_full", ""),
+            ACTION_SNIP: self.cfg.get("hotkey_snip", ""),
+        }
+        active = self.hotkeys.registered_bindings()
+        failed = [action for action in expected if action not in active]
+
+        if failed and len(failed) == len(expected):
+            self.logger.warning(
+                "没有任何快捷键注册成功（%s），请检查设置与其他程序占用情况",
+                "、".join(format_hotkey(expected[action]) for action in failed),
+            )
+            return
+        for action in failed:
+            self.logger.warning(
+                "快捷键 %s（%s）注册失败，可能被其他程序占用或组合无效",
+                action, format_hotkey(expected[action]),
+            )
+        if active:
+            self.logger.info(
+                "热键注册完成：%s",
+                "，".join(f"{action}={format_hotkey(hotkey)}"
+                          for action, hotkey in active.items()),
+            )
 
     def _warn_if_elevated(self) -> None:
         """以管理员权限运行时提示：剪贴板可能因 UIPI 无法被普通程序粘贴。"""

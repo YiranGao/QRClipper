@@ -9,6 +9,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import threading
+import time
 from ctypes import wintypes
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -211,11 +212,19 @@ class HotKeyManager(threading.Thread):
         self._thread_id = 0
         self._ready = threading.Event()
         self._running = False
+        # 重载是异步的（只投递消息），用这一对计数器判断"是否已经真的重载完"
+        self._reload_pending = 0
+        self._reload_done = 0
 
     # ---------- 对外接口 ----------
     def update_bindings(self, bindings: Dict[str, str]) -> None:
-        """更新快捷键绑定并热重载。"""
+        """更新快捷键绑定并热重载。
+
+        注意：这里只是投递 WM_APP_RELOAD，真正的 RegisterHotKey 稍后才在
+        消息线程里发生。要读取注册结果请先调用 wait_bindings()。
+        """
         self._bindings = dict(bindings)
+        self._reload_pending += 1
         if self._hwnd:
             user32.PostMessageW(self._hwnd, WM_APP_RELOAD, 0, 0)
 
@@ -229,6 +238,19 @@ class HotKeyManager(threading.Thread):
 
     def wait_ready(self, timeout: float = 3.0) -> bool:
         return self._ready.wait(timeout)
+
+    def wait_bindings(self, timeout: float = 2.0) -> bool:
+        """等待最近一次 update_bindings 触发的重载真正执行完毕。
+
+        直接读 registered_bindings() 会拿到重载前的旧值（通常是空字典），
+        从而把"还没来得及注册"误判成"注册失败"。超时返回 False。
+        """
+        deadline = time.perf_counter() + timeout
+        while self._reload_done < self._reload_pending:
+            if time.perf_counter() >= deadline:
+                return False
+            time.sleep(0.005)
+        return True
 
     def stop(self) -> None:
         """停止消息循环并结束线程。"""
@@ -276,7 +298,7 @@ class HotKeyManager(threading.Thread):
         self._running = False
 
     def _reload(self) -> None:
-        """注销全部热键并按当前绑定重新注册。"""
+        """注销全部热键并按当前绑定重新注册（只在热键线程执行）。"""
         if not self._hwnd:
             return
         for hotkey_id in list(self._registered):
@@ -301,3 +323,5 @@ class HotKeyManager(threading.Thread):
                 logger.warning(
                     "注册热键失败 %s -> %s（可能被其他程序占用）", action_id, format_hotkey(hotkey)
                 )
+        # 本次重载已完成，wait_bindings() 据此放行
+        self._reload_done = self._reload_pending

@@ -166,6 +166,57 @@ class TestDpi(unittest.TestCase):
         self.assertLessEqual(y, top + height)
 
 
+class TestHotkeyManagerReload(unittest.TestCase):
+    """热键重载是异步的：判断注册结果前必须先 wait_bindings()。
+
+    曾经的 bug：update_bindings() 只投递 WM_APP_RELOAD，调用方立刻读
+    registered_bindings() 拿到空字典，于是每次启动都误报
+    「没有任何快捷键注册成功」，反而误导正在排查热键问题的用户。
+    """
+
+    @staticmethod
+    def _manager(bindings):
+        from hotkey import HotKeyManager
+
+        manager = HotKeyManager(lambda _action: None)
+        manager.start()
+        return manager
+
+    def test_wait_bindings_then_all_registered(self):
+        bindings = {"full": "ctrl+alt+shift+f15", "snip": "ctrl+alt+shift+f16"}
+        manager = self._manager(bindings)
+        try:
+            self.assertTrue(manager.wait_ready(3.0))
+            manager.update_bindings(bindings)
+            self.assertTrue(manager.wait_bindings(2.0))
+            self.assertEqual(manager.registered_bindings(), bindings)
+        finally:
+            manager.stop()
+
+    def test_invalid_binding_is_reported_after_wait(self):
+        """组合非法时 wait_bindings 仍要返回，且该项确实不在注册结果里。"""
+        bindings = {"full": "ctrl+nonexistentkey", "snip": "ctrl+alt+shift+f17"}
+        manager = self._manager(bindings)
+        try:
+            self.assertTrue(manager.wait_ready(3.0))
+            manager.update_bindings(bindings)
+            self.assertTrue(manager.wait_bindings(2.0))
+            active = manager.registered_bindings()
+            self.assertNotIn("full", active)
+            self.assertIn("snip", active)
+        finally:
+            manager.stop()
+
+    def test_wait_bindings_without_update_returns_immediately(self):
+        manager = self._manager({})
+        try:
+            self.assertTrue(manager.wait_ready(3.0))
+            self.assertTrue(manager.wait_bindings(0.1))
+            self.assertEqual(manager.registered_bindings(), {})
+        finally:
+            manager.stop()
+
+
 class TestClipboard(unittest.TestCase):
     def test_write_and_read(self):
         probe = f"QRClipper-{time.time()}"
