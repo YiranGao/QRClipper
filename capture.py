@@ -2,13 +2,18 @@
 
 不使用 PIL.ImageGrab，直接用 GetDC + BitBlt + GetDIBits，
 这样可以正确处理虚拟屏幕的负坐标（副屏在主屏左侧的情况）。
+
+坐标系约定：本模块对外一律使用**物理像素**的虚拟屏幕坐标。要让
+GetSystemMetrics / BitBlt / GetCursorPos 三者口径一致，进程必须先声明
+DPI 感知（见 enable_dpi_awareness），否则 Windows 会对 DPI 无感知进程
+做坐标虚拟化（4K@150% 时会把 3840x2160 报告成 2560x1440）。
 """
 
 from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
-from typing import Tuple
+from typing import Dict, List, Optional, Tuple
 
 from PIL import Image
 
@@ -22,23 +27,112 @@ SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
 SM_CXVIRTUALSCREEN = 78
 SM_CYVIRTUALSCREEN = 79
+SM_CXSCREEN = 0
+SM_CYSCREEN = 1
 
 # GetSystemMetrics 用的是 int，虚拟屏坐标可为负
 user32.GetSystemMetrics.argtypes = [ctypes.c_int]
 user32.GetSystemMetrics.restype = ctypes.c_int
+user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+user32.GetCursorPos.restype = wintypes.BOOL
+user32.GetDpiForSystem.argtypes = []
+user32.GetDpiForSystem.restype = ctypes.c_uint
+user32.GetDpiForWindow.argtypes = [wintypes.HWND]
+user32.GetDpiForWindow.restype = ctypes.c_uint
 
 PROCESS_PER_MONITOR_DPI_AWARE = 2
+# DPI_AWARENESS_CONTEXT 实际是个指针大小的句柄，V2 定义为 -4
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+
+# DPI_AWARENESS 枚举（GetAwarenessFromDpiAwarenessContext 的返回值）
+DPI_AWARENESS_NAMES = {
+    0: "UNAWARE",
+    1: "SYSTEM_AWARE",
+    2: "PER_MONITOR_AWARE",
+}
+MDT_EFFECTIVE_DPI = 0
+
+# 感知级别由高到低排序，便于比较
+_AWARENESS_RANK = {"UNAWARE": 0, "SYSTEM_AWARE": 1, "PER_MONITOR_AWARE": 2,
+                   "PER_MONITOR_AWARE_V2": 3}
 
 
-def enable_dpi_awareness() -> None:
-    """声明进程为 DPI 感知，避免高 DPI 屏幕上截图被缩放导致识别失败。"""
+def current_dpi_awareness() -> str:
+    """查询本进程当前实际生效的 DPI 感知级别。
+
+    优先用 GetThreadDpiAwarenessContext（Win10 1607+），
+    退回 GetProcessDpiAwareness（Win8.1+），两者都不可用时返回 "UNKNOWN"。
+    """
     try:
-        shcore.SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE)
+        get_context = user32.GetThreadDpiAwarenessContext
+        get_context.argtypes = []
+        get_context.restype = wintypes.LPVOID
+        from_context = user32.GetAwarenessFromDpiAwarenessContext
+        from_context.argtypes = [wintypes.LPVOID]
+        from_context.restype = ctypes.c_uint
+        value = int(from_context(get_context()))
+        return DPI_AWARENESS_NAMES.get(value, "UNKNOWN")
     except (AttributeError, OSError):
+        pass
+
+    try:
+        get_process = shcore.GetProcessDpiAwareness
+        get_process.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_uint)]
+        get_process.restype = ctypes.HRESULT
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        value = ctypes.c_uint(0)
+        get_process(kernel32.GetCurrentProcess(), ctypes.byref(value))
+        return DPI_AWARENESS_NAMES.get(value.value, "UNKNOWN")
+    except (AttributeError, OSError):
+        return "UNKNOWN"
+
+
+def enable_dpi_awareness() -> str:
+    """声明进程为 DPI 感知，避免高 DPI 屏幕上截图被缩放导致识别失败。
+
+    依次尝试 Per-Monitor V2 -> Per-Monitor -> System Aware，
+    返回**实际生效**的感知级别（失败时查询真实值，不会谎报成功）。
+
+    注意：旧实现给 SetProcessDpiAwareness 留了默认的 int restype，
+    于是它返回 E_ACCESSDENIED 时不会抛异常，后面两级兜底永远走不到，
+    感知设置失败被静默吞掉。这里显式声明 restype 修掉该问题。
+    """
+    try:
+        set_context = user32.SetProcessDpiAwarenessContext
+    except AttributeError:
+        set_context = None
+    if set_context is not None:
+        set_context.argtypes = [wintypes.LPVOID]
+        set_context.restype = wintypes.BOOL
         try:
-            user32.SetProcessDPIAware()
-        except (AttributeError, OSError):
+            if set_context(ctypes.c_void_p(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)):
+                return current_dpi_awareness()
+        except OSError:
             pass
+
+    try:
+        set_awareness = shcore.SetProcessDpiAwareness
+    except AttributeError:
+        set_awareness = None
+    if set_awareness is not None:
+        set_awareness.argtypes = [ctypes.c_uint]
+        set_awareness.restype = ctypes.HRESULT
+        try:
+            if set_awareness(PROCESS_PER_MONITOR_DPI_AWARE) >= 0:
+                return current_dpi_awareness()
+        except OSError:
+            # E_ACCESSDENIED：感知级别已被（清单或前面的调用）固定，不是错误
+            pass
+
+    try:
+        if user32.SetProcessDPIAware():
+            return current_dpi_awareness()
+    except (AttributeError, OSError):
+        pass
+
+    return current_dpi_awareness()
 
 
 def virtual_screen_rect() -> Tuple[int, int, int, int]:
@@ -48,10 +142,93 @@ def virtual_screen_rect() -> Tuple[int, int, int, int]:
     width = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
     height = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
     if width <= 0 or height <= 0:  # 极少见的取值失败，退回主屏
-        width = user32.GetSystemMetrics(0)
-        height = user32.GetSystemMetrics(1)
+        width = user32.GetSystemMetrics(SM_CXSCREEN)
+        height = user32.GetSystemMetrics(SM_CYSCREEN)
         left, top = 0, 0
     return left, top, width, height
+
+
+def cursor_pos() -> Optional[Tuple[int, int]]:
+    """返回鼠标在虚拟屏幕上的**物理像素**坐标，失败返回 None。
+
+    与 Tk 的 event.x_root / winfo_pointerx 相比，GetCursorPos 不受 Tk 自身
+    缩放与窗口层级影响，是框选坐标换算的可靠来源。
+    """
+    point = wintypes.POINT()
+    if not user32.GetCursorPos(ctypes.byref(point)):
+        return None
+    return int(point.x), int(point.y)
+
+
+def monitor_dpis() -> List[Tuple[int, int, int, int, int, int]]:
+    """枚举显示器，返回 [(left, top, right, bottom, dpi_x, dpi_y)]。"""
+    result: List[Tuple[int, int, int, int, int, int]] = []
+
+    MONITORENUMPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_int,
+        wintypes.HMONITOR,
+        wintypes.HDC,
+        ctypes.POINTER(wintypes.RECT),
+        wintypes.LPARAM,
+    )
+    user32.EnumDisplayMonitors.argtypes = [
+        wintypes.HDC,
+        ctypes.POINTER(wintypes.RECT),
+        MONITORENUMPROC,
+        wintypes.LPARAM,
+    ]
+    user32.EnumDisplayMonitors.restype = wintypes.BOOL
+    get_dpi = getattr(shcore, "GetDpiForMonitor", None)
+    if get_dpi is not None:
+        get_dpi.argtypes = [
+            wintypes.HMONITOR,
+            ctypes.c_int,
+            ctypes.POINTER(wintypes.UINT),
+            ctypes.POINTER(wintypes.UINT),
+        ]
+        get_dpi.restype = ctypes.HRESULT
+
+    def _callback(handle: int, _hdc: int, rect_ptr: int, _lparam: int) -> int:
+        rect = ctypes.cast(rect_ptr, ctypes.POINTER(wintypes.RECT)).contents
+        dpi_x, dpi_y = 0, 0
+        if get_dpi is not None:
+            value_x, value_y = wintypes.UINT(0), wintypes.UINT(0)
+            try:
+                get_dpi(handle, MDT_EFFECTIVE_DPI, ctypes.byref(value_x), ctypes.byref(value_y))
+                dpi_x, dpi_y = int(value_x.value), int(value_y.value)
+            except OSError:
+                dpi_x, dpi_y = 0, 0
+        result.append((int(rect.left), int(rect.top), int(rect.right), int(rect.bottom),
+                       dpi_x, dpi_y))
+        return 1
+
+    try:
+        user32.EnumDisplayMonitors(None, None, MONITORENUMPROC(_callback), 0)
+    except OSError:
+        return result
+    return result
+
+
+def system_dpi() -> int:
+    """返回系统 DPI（失败返回 96）。"""
+    try:
+        value = int(user32.GetDpiForSystem())
+        return value if value > 0 else 96
+    except (AttributeError, OSError):
+        return 96
+
+
+def dpi_summary() -> Dict[str, object]:
+    """返回 DPI / 缩放 / 虚拟屏幕的诊断信息，供日志与 --doctor 使用。"""
+    dpi = system_dpi()
+    left, top, width, height = virtual_screen_rect()
+    return {
+        "awareness": current_dpi_awareness(),
+        "system_dpi": dpi,
+        "scale_percent": round(dpi / 96.0 * 100),
+        "virtual_screen": (left, top, width, height),
+        "monitors": monitor_dpis(),
+    }
 
 
 class BITMAPINFOHEADER(ctypes.Structure):

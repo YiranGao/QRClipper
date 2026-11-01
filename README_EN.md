@@ -52,10 +52,25 @@ Modifiers (Ctrl / Alt / Shift / Win) are detected by reading the live keyboard s
 QRClipper.exe --scan       :: scan the full screen once, copy the result, and exit
 QRClipper.exe --snip       :: open region selection once, then exit after reading
 QRClipper.exe --selftest   :: self-test (generates a test QR code to verify the recognition pipeline, and checks clipboard read/write)
+QRClipper.exe --doctor     :: environment diagnostics (DPI / coordinates / hotkeys / engines / elevation / autostart / clipboard)
 QRClipper.exe --no-tray    :: run without a tray icon (stays resident but takes no tray space)
 ```
 
-`--scan` can be hooked into other automation workflows; only one resident instance is allowed at a time (a second launch exits automatically).
+`--scan` can be hooked into other automation workflows; only one resident instance is allowed at a time (a second launch shows a message box).
+
+## Troubleshooting
+
+Run `QRClipper.exe --doctor` first (or check the startup log). It prints the DPI
+awareness level, scaling, physical screen size, whether Tk coordinates match,
+whether both hotkeys registered, the available engines, whether the process is
+elevated, the autostart state, and a clipboard round-trip check.
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Hotkeys dead after a reboot | `autostart` is `false`, so the app never starts | Enable "Launch at startup" in the tray menu, or start it manually |
+| Double-clicking the exe does nothing | An instance is already running (the tray icon may be collapsed into the hidden area) | A message box is shown; quit from the tray and start again |
+| Recognized but cannot paste | Running elevated (UIPI) or the clipboard was taken over by another app | Do not run as administrator; the app now reports copy failures explicitly |
+| Small QR on a 4K screen not found | The code is tiny relative to the full screen | Use region selection; whole-image failures now fall back to a tiled sliding-window scan |
 
 ## Config & logs
 
@@ -83,8 +98,9 @@ Editing this file directly and restarting the app works just as well.
 pip install pillow pyzbar zxing-cpp pystray
 python qrclip.py            :: resident mode
 python qrclip.py --selftest :: self-test
+python qrclip.py --doctor   :: environment diagnostics
 python tests\test_smoke.py                              :: smoke tests (run the file directly)
-python -m unittest tests.test_smoke tests.test_hotkey_entry  :: non-interactive regression (recommended)
+python -m unittest tests.test_smoke tests.test_hotkey_entry tests.test_decoder_tiles  :: non-interactive regression (recommended)
 python build.py             :: package with PyInstaller into dist\QRClipper.exe
 ```
 

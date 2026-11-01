@@ -8,6 +8,7 @@
     --scan      立即全屏识别一次并退出（可用于命令行/其他程序调用）
     --snip      弹出框选一次并退出
     --selftest  生成测试二维码图片并自检识别链路
+    --doctor    输出环境诊断（DPI/坐标/热键/引擎/权限/自启动/剪贴板）
     --no-tray   不显示托盘图标（配合 --scan 使用）
 """
 
@@ -29,9 +30,10 @@ import capture
 import clipboard
 import config as config_module
 from config import Config, set_autostart, setup_logging
+import decoder as decoder_module
 from decoder import decode_image
 from hotkey import HotKeyManager, format_hotkey, parse_hotkey
-from ui import SettingsWindow, Snipper, make_tray_image
+from ui import SettingsWindow, Snipper, ToastWindow, make_tray_image
 
 ACTION_FULL = "full"
 ACTION_SNIP = "snip"
@@ -39,6 +41,18 @@ ACTION_SNIP = "snip"
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 kernel32.CreateMutexW.argtypes = [wintypes.LPCVOID, wintypes.BOOL, wintypes.LPCWSTR]
 kernel32.CreateMutexW.restype = wintypes.HANDLE
+
+
+def is_process_elevated() -> bool:
+    """判断当前进程是否以提升权限（管理员）运行。
+
+    高完整性进程写入的剪贴板，普通权限的程序受 UIPI 限制往往读不出来，
+    用户会表现为「识别成功但粘贴不到内容」，因此需要在启动时明确提示。
+    """
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
 
 
 class SingleInstance:
@@ -73,19 +87,67 @@ class App:
     # ---------- 生命周期 ----------
     def start(self) -> None:
         self._apply_autostart()
+        self._log_environment()
         self.hotkeys.start()
         self.hotkeys.wait_ready()
         self._reload_hotkeys()
+        if not self.hotkeys.registered_bindings():
+            self.logger.warning("没有任何快捷键注册成功，请检查设置与其他程序占用情况")
 
         if self.show_tray:
             self._start_tray()
 
+        self._warn_if_elevated()
         self.logger.info(
             "QRClipper 已启动：全屏=%s 框选=%s",
             format_hotkey(self.cfg.get("hotkey_full")),
             format_hotkey(self.cfg.get("hotkey_snip")),
         )
         self.root.mainloop()
+
+    def _log_environment(self) -> None:
+        """把 DPI / 缩放 / 坐标系 / 自启动状态写进日志，便于事后定位。"""
+        summary = capture.dpi_summary()
+        self.logger.info(
+            "环境：DPI 感知=%s 系统 DPI=%d（缩放 %d%%） 虚拟屏幕=%s",
+            summary["awareness"],
+            summary["system_dpi"],
+            summary["scale_percent"],
+            summary["virtual_screen"],
+        )
+        for index, (left, top, right, bottom, dpi_x, dpi_y) in enumerate(summary["monitors"]):
+            self.logger.info(
+                "  显示器#%d %dx%d @(%d,%d) dpi=%d/%d（缩放 %d%%）",
+                index, right - left, bottom - top, left, top, dpi_x, dpi_y,
+                round(dpi_x / 96.0 * 100),
+            )
+
+        # Tk 的屏幕尺寸必须与物理虚拟屏幕一致，否则框选坐标会整体错位
+        tk_size = (self.root.winfo_screenwidth(), self.root.winfo_screenheight())
+        physical = (summary["virtual_screen"][2], summary["virtual_screen"][3])
+        if tk_size != physical:
+            self.logger.warning(
+                "Tk 屏幕尺寸 %dx%d 与物理虚拟屏幕 %dx%d 不一致，框选坐标可能错位",
+                tk_size[0], tk_size[1], physical[0], physical[1],
+            )
+
+        autostart = bool(self.cfg.get("autostart"))
+        self.logger.info(
+            "开机自启动：%s",
+            "已开启" if autostart else "已关闭（重启电脑后不会自动运行，需要手动启动）",
+        )
+
+    def _warn_if_elevated(self) -> None:
+        """以管理员权限运行时提示：剪贴板可能因 UIPI 无法被普通程序粘贴。"""
+        if not is_process_elevated():
+            return
+        message = (
+            "检测到 QRClipper 正以管理员权限运行。\n"
+            "此时写入的剪贴板内容，普通权限的程序可能粘贴不出来（UIPI 限制）。\n"
+            "建议退出后以普通方式启动。"
+        )
+        self.logger.warning("进程处于提升权限状态，剪贴板写入可能被 UIPI 拦截")
+        self._notify("请不要以管理员身份运行", message)
 
     def _start_tray(self) -> None:
         try:
@@ -213,6 +275,10 @@ class App:
         started = time.perf_counter()
         try:
             image = capture.grab(region) if region else capture.grab_all()
+            self.logger.info(
+                "截图完成：%dx%d（%s）", image.width, image.height,
+                f"区域 {region}" if region else "全屏",
+            )
             texts = decode_image(image)
         except Exception as exc:
             self.logger.exception("识别过程异常：%s", exc)
@@ -223,31 +289,61 @@ class App:
     def _present(self, texts: List[str], elapsed_ms: int) -> None:
         if not texts:
             self.logger.info("未识别到二维码（耗时 %d ms）", elapsed_ms)
-            self._notify("未识别到二维码", "请确认二维码在屏幕上清晰可见")
+            self._notify(
+                "未识别到二维码",
+                "请确认二维码在屏幕上清晰可见；4K 屏上很小的码建议用「框选识别」缩小范围。",
+            )
             self._beep(False)
             return
 
         joined = "\n".join(texts)
-        if self.cfg.get("copy_to_clipboard", True):
-            if not clipboard.set_text(joined):
+        copy_enabled = bool(self.cfg.get("copy_to_clipboard", True))
+        copied = False
+        if copy_enabled:
+            copied = clipboard.set_text(joined)
+            if copied:
+                # 回读校验：剪贴板可能被剪贴板管理器 / 云同步 / 其他程序抢走，
+                # 只凭 SetClipboardData 的返回值判断会把「复制失败」误报成成功。
+                readback = clipboard.get_text()
+                if readback != joined:
+                    copied = False
+                    self.logger.warning("剪贴板回读校验失败（读到 %r）", (readback or "")[:60])
+            if not copied:
                 self.logger.warning("写入剪贴板失败")
+
         self.logger.info("识别成功（%d 个，耗时 %d ms）", len(texts), elapsed_ms)
 
         preview = texts[0] if len(texts) == 1 else f"{texts[0]}\n…共 {len(texts)} 个"
         if len(preview) > 120:
             preview = preview[:120] + "…"
-        title = f"已复制 {len(texts)} 个二维码内容" if len(texts) > 1 else "已复制到剪贴板"
-        self._notify(title, preview)
-        self._beep(True)
+
+        if not copy_enabled:
+            self._notify(f"识别到 {len(texts)} 个二维码", preview)
+        elif copied:
+            title = f"已复制 {len(texts)} 个二维码内容" if len(texts) > 1 else "已复制到剪贴板"
+            self._notify(title, preview)
+        else:
+            self._notify(
+                "识别成功，但复制失败",
+                "剪贴板可能被其他程序占用或被安全软件拦截。\n"
+                "可重试一次，或在设置里关闭「识别结果写入剪贴板」改用提示框查看。",
+            )
+        self._beep(copied or not copy_enabled)
 
     def _notify(self, title: str, message: str) -> None:
+        """气泡提示；托盘不可用或被系统拦截时退回 Tk 浮窗，保证用户一定看得到。"""
         if not self.cfg.get("notify", True):
             return
         if self.icon is not None:
             try:
                 self.icon.notify(message, title)
+                return
             except Exception as exc:
-                self.logger.debug("气泡提示失败：%s", exc)
+                self.logger.warning("气泡提示失败，改用浮窗提示：%s", exc)
+        try:
+            ToastWindow(self.root, title, message)
+        except Exception as exc:
+            self.logger.warning("浮窗提示失败：%s", exc)
 
     def _beep(self, success: bool) -> None:
         if not self.cfg.get("sound", False):
@@ -387,11 +483,102 @@ def run_selftest() -> int:
     return 0 if passed == total else 1
 
 
+def run_doctor() -> int:
+    """输出环境诊断：DPI / 坐标 / 热键 / 引擎 / 权限 / 自启动 / 剪贴板。
+
+    用于定位「快捷键没反应」「框选位置不对」「识别不到」「复制不到」这类
+    与机器环境强相关的问题。
+    """
+    capture.enable_dpi_awareness()
+    setup_logging()  # _emit 会把报告同时写进日志，打包后靠它留痕
+    report: List[str] = []
+
+    def emit(text: str) -> None:
+        report.append(text)
+        _emit(text)
+
+    emit("===== QRClipper 环境诊断 =====")
+    summary = capture.dpi_summary()
+    emit(f"DPI 感知级别    : {summary['awareness']}")
+    emit(f"系统 DPI / 缩放 : {summary['system_dpi']} / {summary['scale_percent']}%")
+    emit(f"虚拟屏幕(物理)  : {summary['virtual_screen']}")
+    for index, (left, top, right, bottom, dpi_x, dpi_y) in enumerate(summary["monitors"]):
+        emit(
+            f"  显示器#{index}      : {right - left}x{bottom - top} @({left},{top}) "
+            f"dpi={dpi_x}/{dpi_y} 缩放={round(dpi_x / 96.0 * 100)}%"
+        )
+
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.update_idletasks()
+        tk_size = (root.winfo_screenwidth(), root.winfo_screenheight())
+        physical = (summary["virtual_screen"][2], summary["virtual_screen"][3])
+        same = "一致" if tk_size == physical else "*** 与物理屏幕不一致，框选会错位 ***"
+        emit(f"Tk 屏幕尺寸     : {tk_size} -> {same}")
+        cursor = capture.cursor_pos()
+        emit(f"鼠标 物理 / Tk  : {cursor} / {(root.winfo_pointerx(), root.winfo_pointery())}")
+        root.destroy()
+    except Exception as exc:
+        emit(f"Tk 坐标检查失败 : {exc}")
+
+    cfg = Config()
+    bindings = {
+        ACTION_FULL: cfg.get("hotkey_full", ""),
+        ACTION_SNIP: cfg.get("hotkey_snip", ""),
+    }
+    manager = HotKeyManager(lambda _action: None)
+    manager.start()
+    manager.wait_ready(3.0)
+    manager.update_bindings(bindings)
+    time.sleep(0.5)
+    active = manager.registered_bindings()
+    for action_id, hotkey in bindings.items():
+        ok = action_id in active
+        emit(
+            f"热键 {action_id:<5}     : {format_hotkey(hotkey)} -> "
+            f"{'注册成功' if ok else '*** 注册失败，可能被其他程序占用 ***'}"
+        )
+    manager.stop()
+
+    engines = [name for name, _fn in decoder_engines()]
+    emit(f"识别引擎        : {', '.join(engines) if engines else '*** 无可用引擎 ***'}")
+    emit(f"管理员权限      : {'是（剪贴板可能被 UIPI 拦截）' if is_process_elevated() else '否'}")
+    emit(
+        f"开机自启动      : {'已开启' if cfg.get('autostart') else '已关闭'}"
+        f"（注册表状态：{'已写入' if config_module.is_autostart_enabled() else '无'}）"
+    )
+
+    probe = "QRClipper-doctor-" + time.strftime("%H%M%S")
+    clipboard_ok = clipboard.set_text(probe) and clipboard.verify_text(probe)
+    emit(f"剪贴板 写/读    : {'正常' if clipboard_ok else '*** 校验失败 ***'}")
+
+    started = time.perf_counter()
+    try:
+        image = capture.grab_all()
+        texts = decode_image(image)
+        grab_ms = int((time.perf_counter() - started) * 1000)
+        emit(f"全屏截图+识别   : {image.width}x{image.height}，{grab_ms} ms，命中 {len(texts)} 个")
+    except Exception as exc:
+        emit(f"全屏截图失败    : {exc}")
+
+    emit("===== 诊断结束 =====")
+    if sys.stdout is None or getattr(sys, "frozen", False):
+        _show_message("QRClipper 环境诊断", "\n".join(report))
+    return 0
+
+
+def decoder_engines() -> List[tuple]:
+    """返回可用的识别引擎列表 [(名称, 函数)]，供诊断与测试复用。"""
+    return decoder_module._load_engines()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="屏幕二维码识别并复制到剪贴板")
     parser.add_argument("--scan", action="store_true", help="全屏识别一次后退出")
     parser.add_argument("--snip", action="store_true", help="框选识别一次后退出")
     parser.add_argument("--selftest", action="store_true", help="运行识别链路自检")
+    parser.add_argument("--doctor", action="store_true", help="输出环境诊断信息")
     parser.add_argument("--no-tray", action="store_true", help="不显示托盘图标")
     args = parser.parse_args()
 
@@ -403,6 +590,8 @@ def main() -> int:
 
     if args.selftest:
         return run_selftest()
+    if args.doctor:
+        return run_doctor()
     if args.scan:
         return run_single_scan()
     if args.snip:
@@ -426,7 +615,16 @@ def main() -> int:
 
     guard = SingleInstance()
     if guard.already_running:
-        print("QRClipper 已在运行中（托盘图标位于屏幕右下角）", file=sys.stderr)
+        # 打包成 windowed 程序后没有控制台，只写 stderr 等于毫无反馈，
+        # 用户会以为「双击没反应 / 程序没起来」。这里额外弹窗 + 记日志。
+        message = (
+            "QRClipper 已经在运行中，无需重复启动。\n"
+            "托盘图标可能被 Windows 折叠进了任务栏右下角的隐藏区域，"
+            "点开即可看到；若热键无反应，请先从托盘退出后重新启动。"
+        )
+        print(message, file=sys.stderr)
+        setup_logging().info("重复启动被拒绝：已有实例在运行")
+        _show_message("QRClipper 已在运行中", message)
         return 0
 
     app = App(show_tray=not args.no_tray)

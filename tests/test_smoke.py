@@ -131,6 +131,41 @@ class TestCapture(unittest.TestCase):
             capture.normalize_region(10, 10, 12, 12)
 
 
+class TestDpi(unittest.TestCase):
+    """DPI 感知与坐标系：框选坐标错位的根因排查面。"""
+
+    def test_enable_dpi_awareness_reports_real_level(self):
+        """返回值必须是真实生效的感知级别，不能谎报成功。"""
+        level = capture.enable_dpi_awareness()
+        self.assertIn(
+            level,
+            ("PER_MONITOR_AWARE", "PER_MONITOR_AWARE_V2", "SYSTEM_AWARE", "UNAWARE", "UNKNOWN"),
+        )
+        # 声明过之后再次查询，结果应当已知且非 UNKNOWN
+        self.assertNotEqual(capture.current_dpi_awareness(), "UNKNOWN")
+
+    def test_virtual_screen_matches_system_metrics(self):
+        left, top, width, height = capture.virtual_screen_rect()
+        self.assertGreater(width, 0)
+        self.assertGreater(height, 0)
+        summary = capture.dpi_summary()
+        self.assertEqual(summary["virtual_screen"], (left, top, width, height))
+        self.assertGreater(summary["system_dpi"], 0)
+        self.assertIsInstance(summary["monitors"], list)
+
+    def test_cursor_pos_is_physical(self):
+        """GetCursorPos 的结果必须落在虚拟屏幕范围内（物理像素口径）。"""
+        position = capture.cursor_pos()
+        if position is None:  # 无会话环境（如服务账户）允许拿不到
+            self.skipTest("当前环境无法获取鼠标位置")
+        x, y = position
+        left, top, width, height = capture.virtual_screen_rect()
+        self.assertGreaterEqual(x, left)
+        self.assertGreaterEqual(y, top)
+        self.assertLessEqual(x, left + width)
+        self.assertLessEqual(y, top + height)
+
+
 class TestClipboard(unittest.TestCase):
     def test_write_and_read(self):
         probe = f"QRClipper-{time.time()}"
@@ -141,6 +176,16 @@ class TestClipboard(unittest.TestCase):
         probe = "中文✅ emoji 🚀"
         self.assertTrue(clipboard.set_text(probe))
         self.assertEqual(clipboard.get_text(), probe)
+
+    def test_verify_text_after_write(self):
+        """写入后回读校验：刚写完立刻回读也必须拿到内容（旧实现会误报失败）。"""
+        probe = f"VERIFY-{time.time()}"
+        self.assertTrue(clipboard.set_text(probe))
+        self.assertTrue(clipboard.verify_text(probe))
+
+    def test_verify_text_detects_mismatch(self):
+        self.assertTrue(clipboard.set_text("SENTINEL-OK"))
+        self.assertFalse(clipboard.verify_text("SOMETHING-ELSE"))
 
 
 if __name__ == "__main__":

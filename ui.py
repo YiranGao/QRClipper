@@ -14,7 +14,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageDraw
 
-from capture import virtual_screen_rect
+from capture import cursor_pos, virtual_screen_rect
 from hotkey import VK_DISPLAY_NAMES
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -204,9 +204,19 @@ class Snipper:
         self,
         root: tk.Misc,
         on_finish: Callable[[Optional[Tuple[int, int, int, int]]], None],
+        coord_provider: Optional[Callable[[], Optional[Tuple[int, int]]]] = None,
     ) -> None:
+        """创建遮罩。
+
+        Args:
+            root: Tk 根窗口。
+            on_finish: 选区回调，(left, top, right, bottom) 或 None（取消）。
+            coord_provider: 返回鼠标物理像素坐标的函数，默认用
+                capture.cursor_pos（GetCursorPos）。测试可注入固定值。
+        """
         self._root = root
         self._on_finish = on_finish
+        self._coord_provider = coord_provider or cursor_pos
         self._start: Optional[Tuple[int, int]] = None
         self._rect = None
         self._vleft, self._vtop, self._vwidth, self._vheight = virtual_screen_rect()
@@ -247,7 +257,18 @@ class Snipper:
 
     # ---------- 事件 ----------
     def _to_canvas(self, event: tk.Event) -> Tuple[int, int]:
-        return event.x_root - self._vleft, event.y_root - self._vtop
+        """换算成遮罩内的物理像素坐标。
+
+        截图用的是物理像素（capture.virtual_screen_rect），所以鼠标坐标也必须
+        取物理像素：优先用 GetCursorPos，拿不到才退回 Tk 的 x_root/y_root。
+        实测 4K@150% 下两者一致（差值 0），但 GetCursorPos 不受 Tk 自身缩放与
+        多显示器混合 DPI 影响，是更可靠的口径。
+        """
+        position = self._coord_provider()
+        if position is None:
+            return event.x_root - self._vleft, event.y_root - self._vtop
+        x, y = position
+        return x - self._vleft, y - self._vtop
 
     def _on_press(self, event: tk.Event) -> None:
         self._start = self._to_canvas(event)
@@ -287,6 +308,52 @@ class Snipper:
         except tk.TclError:
             pass
         self._on_finish(region)
+
+
+class ToastWindow:
+    """兜底提示小窗：托盘气泡不可用（--no-tray / pystray 缺失 / 被系统拦截）时使用。
+
+    常驻右上角，几秒后自动关闭，不抢焦点、不阻塞主循环。
+    """
+
+    def __init__(
+        self,
+        root: tk.Misc,
+        title: str,
+        message: str,
+        duration_ms: int = 4000,
+    ) -> None:
+        self.win = tk.Toplevel(root)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.configure(bg="#1f1f1f")
+
+        frame = tk.Frame(self.win, bg="#1f1f1f", padx=14, pady=10)
+        frame.pack(fill="both", expand=True)
+        tk.Label(
+            frame, text=title, bg="#1f1f1f", fg="#ffffff",
+            font=("Microsoft YaHei UI", 10, "bold"), anchor="w", justify="left",
+        ).pack(fill="x")
+        tk.Label(
+            frame, text=message, bg="#1f1f1f", fg="#dddddd",
+            font=("Microsoft YaHei UI", 9), anchor="w", justify="left",
+            wraplength=360,
+        ).pack(fill="x", pady=(4, 0))
+
+        self.win.update_idletasks()
+        width = self.win.winfo_width()
+        height = self.win.winfo_height()
+        vleft, vtop, vwidth, vheight = virtual_screen_rect()
+        x = vleft + vwidth - width - 24
+        y = vtop + vheight - height - 72
+        self.win.geometry(f"+{max(x, vleft)}+{max(y, vtop)}")
+        self.win.after(duration_ms, self.close)
+
+    def close(self) -> None:
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
 
 
 class HotkeyEntry(ttk.Frame):

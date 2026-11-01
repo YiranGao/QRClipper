@@ -118,16 +118,29 @@ def _read_once() -> tuple[bool, Optional[str]]:
 
 
 def get_text(retries: int = 5, delay: float = 0.05) -> Optional[str]:
-    """读取剪贴板文本（用于自检与调试），剪贴板被占用时自动重试。
+    """读取剪贴板文本（用于自检与调试），剪贴板暂时取不到内容时自动重试。
 
-    与 set_text 对称地重试：OpenClipboard 在剪贴板被其他程序短暂占用时会
-    返回失败（ERROR_ACCESS_DENIED），紧跟在写入之后立即读取尤其容易遇到。
-    若剪贴板能打开但其中没有文本数据，则直接返回 None，不做重试。
+    与 set_text 对称地重试。除 OpenClipboard 失败（ERROR_ACCESS_DENIED，剪贴板
+    被其他程序短暂占用）之外，**取不到文本也要重试**：实测（Win11 4K 环境，
+    开启剪贴板历史）刚写完立刻读，OpenClipboard 会成功但 GetClipboardData 返回
+    NULL，再读一次才拿到内容。旧实现在「能打开但没数据」时直接返回 None，
+    导致写入后立刻回读 100% 失败（冒烟用例与 --selftest 都会误报）。
+
+    重试上限内仍拿不到文本才返回 None，即剪贴板里确实没有文本。
     """
     for attempt in range(retries):
-        opened, text = _read_once()
-        if opened:
+        _opened, text = _read_once()
+        if text is not None:
             return text
         if attempt < retries - 1:
             time.sleep(delay)
     return None
+
+
+def verify_text(text: str, retries: int = 5, delay: float = 0.05) -> bool:
+    """回读校验：确认剪贴板里确实是刚写入的内容。
+
+    用于识别成功后确认「真的复制成功了」——剪贴板可能被剪贴板管理器、
+    云同步或其他程序抢走，只凭 SetClipboardData 的返回值判断会误报成功。
+    """
+    return get_text(retries, delay) == text

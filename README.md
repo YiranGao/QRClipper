@@ -49,10 +49,25 @@
 QRClipper.exe --scan       :: 立即全屏识别一次，结果进剪贴板并退出
 QRClipper.exe --snip       :: 弹出框选一次，识别后退出
 QRClipper.exe --selftest   :: 自检（生成测试二维码验证识别链路，并检查剪贴板读写）
+QRClipper.exe --doctor     :: 环境诊断（DPI/坐标/热键/引擎/权限/自启动/剪贴板）
 QRClipper.exe --no-tray    :: 不显示托盘图标（常驻但不占托盘）
 ```
 
-`--scan` 可以挂到别的自动化流程里用；同一时刻只允许一个实例常驻（重复启动会自动退出）。
+`--scan` 可以挂到别的自动化流程里用；同一时刻只允许一个实例常驻（重复启动会弹窗提示）。
+
+## 排查问题先看这里
+
+遇到「快捷键没反应」「框选位置不对」「识别不到」「复制不到」时，先跑一次
+`QRClipper.exe --doctor`（或看启动日志），它会把 DPI 感知级别、缩放比例、
+物理屏幕尺寸、Tk 坐标是否一致、两个热键是否注册成功、识别引擎、是否以管理员
+权限运行、开机自启动状态、剪贴板读写校验全部打印出来。
+
+| 现象 | 常见原因 | 处理 |
+| --- | --- | --- |
+| 重启电脑后快捷键完全没反应 | `autostart` 为 `false`，程序没跟着开机启动 | 托盘菜单勾选「开机自动启动」，或手动启动一次 |
+| 双击 exe 没反应 | 已有实例在跑（托盘图标可能被 Windows 折叠进隐藏区） | 会弹窗提示；从托盘退出后重新启动 |
+| 识别成功但粘贴不出来 | 以管理员权限运行（UIPI 限制）或剪贴板被其他程序抢占 | 不要用管理员身份运行；失败时程序会明确提示 |
+| 4K 屏上小二维码识别不到 | 码相对整屏太小 | 用「框选识别」缩小范围；整图失败时程序会自动做分块滑窗扫描 |
 
 ## 数据与日志
 
@@ -80,8 +95,9 @@ QRClipper.exe --no-tray    :: 不显示托盘图标（常驻但不占托盘）
 pip install pillow pyzbar zxing-cpp pystray
 python qrclip.py            :: 常驻模式
 python qrclip.py --selftest :: 自检
+python qrclip.py --doctor   :: 环境诊断
 python tests\test_smoke.py                              :: 冒烟测试（直接跑单个文件）
-python -m unittest tests.test_smoke tests.test_hotkey_entry  :: 非交互回归（推荐）
+python -m unittest tests.test_smoke tests.test_hotkey_entry tests.test_decoder_tiles  :: 非交互回归（推荐）
 python build.py             :: 用 PyInstaller 打包成 dist\QRClipper.exe
 ```
 
