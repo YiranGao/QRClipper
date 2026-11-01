@@ -50,7 +50,7 @@ DPI_AWARENESS_NAMES = {
     1: "SYSTEM_AWARE",
     2: "PER_MONITOR_AWARE",
 }
-MDT_EFFECTIVE_DPI = 0
+SM_CMONITORS = 80
 
 # 感知级别由高到低排序，便于比较
 _AWARENESS_RANK = {"UNAWARE": 0, "SYSTEM_AWARE": 1, "PER_MONITOR_AWARE": 2,
@@ -160,53 +160,17 @@ def cursor_pos() -> Optional[Tuple[int, int]]:
     return int(point.x), int(point.y)
 
 
-def monitor_dpis() -> List[Tuple[int, int, int, int, int, int]]:
-    """枚举显示器，返回 [(left, top, right, bottom, dpi_x, dpi_y)]。"""
-    result: List[Tuple[int, int, int, int, int, int]] = []
+def monitor_count() -> int:
+    """返回显示器数量。
 
-    MONITORENUMPROC = ctypes.WINFUNCTYPE(
-        ctypes.c_int,
-        wintypes.HMONITOR,
-        wintypes.HDC,
-        ctypes.POINTER(wintypes.RECT),
-        wintypes.LPARAM,
-    )
-    user32.EnumDisplayMonitors.argtypes = [
-        wintypes.HDC,
-        ctypes.POINTER(wintypes.RECT),
-        MONITORENUMPROC,
-        wintypes.LPARAM,
-    ]
-    user32.EnumDisplayMonitors.restype = wintypes.BOOL
-    get_dpi = getattr(shcore, "GetDpiForMonitor", None)
-    if get_dpi is not None:
-        get_dpi.argtypes = [
-            wintypes.HMONITOR,
-            ctypes.c_int,
-            ctypes.POINTER(wintypes.UINT),
-            ctypes.POINTER(wintypes.UINT),
-        ]
-        get_dpi.restype = ctypes.HRESULT
-
-    def _callback(handle: int, _hdc: int, rect_ptr: int, _lparam: int) -> int:
-        rect = ctypes.cast(rect_ptr, ctypes.POINTER(wintypes.RECT)).contents
-        dpi_x, dpi_y = 0, 0
-        if get_dpi is not None:
-            value_x, value_y = wintypes.UINT(0), wintypes.UINT(0)
-            try:
-                get_dpi(handle, MDT_EFFECTIVE_DPI, ctypes.byref(value_x), ctypes.byref(value_y))
-                dpi_x, dpi_y = int(value_x.value), int(value_y.value)
-            except OSError:
-                dpi_x, dpi_y = 0, 0
-        result.append((int(rect.left), int(rect.top), int(rect.right), int(rect.bottom),
-                       dpi_x, dpi_y))
-        return 1
-
+    刻意**不用** EnumDisplayMonitors + ctypes 回调：回调对象生命周期与 GC
+    交互在真实会话里有挂起风险，而诊断信息不值得拿启动流程去冒险。
+    数量用 GetSystemMetrics(SM_CMONITORS) 即可，逐显示器 DPI 不采集。
+    """
     try:
-        user32.EnumDisplayMonitors(None, None, MONITORENUMPROC(_callback), 0)
-    except OSError:
-        return result
-    return result
+        return int(user32.GetSystemMetrics(SM_CMONITORS))
+    except (AttributeError, OSError):
+        return 0
 
 
 def system_dpi() -> int:
@@ -227,7 +191,7 @@ def dpi_summary() -> Dict[str, object]:
         "system_dpi": dpi,
         "scale_percent": round(dpi / 96.0 * 100),
         "virtual_screen": (left, top, width, height),
-        "monitors": monitor_dpis(),
+        "monitor_count": monitor_count(),
     }
 
 

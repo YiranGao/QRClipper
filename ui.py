@@ -310,11 +310,46 @@ class Snipper:
         self._on_finish(region)
 
 
-class ToastWindow:
-    """兜底提示小窗：托盘气泡不可用（--no-tray / pystray 缺失 / 被系统拦截）时使用。
+_ACTIVE_TOASTS: List["ToastWindow"] = []
 
-    常驻右上角，几秒后自动关闭，不抢焦点、不阻塞主循环。
+# Win32 置顶相关
+_USER32 = ctypes.WinDLL("user32", use_last_error=True)
+_HWND_TOPMOST = ctypes.c_void_p(-1)
+_SWP_NOSIZE = 0x0001
+_SWP_NOMOVE = 0x0002
+_SWP_NOACTIVATE = 0x0010
+_GA_ROOT = 2
+_get_ancestor = _USER32.GetAncestor
+_get_ancestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+_get_ancestor.restype = ctypes.c_void_p
+_set_window_pos = _USER32.SetWindowPos
+_set_window_pos.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+    ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+]
+_set_window_pos.restype = ctypes.c_bool
+
+_window_from_point = _USER32.WindowFromPoint
+_window_from_point.argtypes = [wintypes.POINT]
+_window_from_point.restype = ctypes.c_void_p
+_get_window_rect = _USER32.GetWindowRect
+_get_window_rect.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.RECT)]
+_get_window_rect.restype = ctypes.c_bool
+
+
+class ToastWindow:
+    """右下角提示小窗：这是**唯一能保证用户看得见**的通知通道。
+
+    为什么不用系统气泡：真机实测打包成 exe 后 `icon.notify()` 与
+    `Shell_NotifyIcon` 都返回成功但屏幕上什么都不出现（详见 notify.py）。
+    自己画的窗口不经过系统通知策略，只要进程活着就一定看得见。
+
+    多个通知同时到达时向上错开叠放，避免互相遮挡成"只有一条"。
     """
+
+    MARGIN_RIGHT = 24
+    MARGIN_BOTTOM = 72
+    GAP = 8
 
     def __init__(
         self,
@@ -324,8 +359,6 @@ class ToastWindow:
         duration_ms: int = 4000,
     ) -> None:
         self.win = tk.Toplevel(root)
-        self.win.overrideredirect(True)
-        self.win.attributes("-topmost", True)
         self.win.configure(bg="#1f1f1f")
 
         frame = tk.Frame(self.win, bg="#1f1f1f", padx=14, pady=10)
@@ -343,13 +376,102 @@ class ToastWindow:
         self.win.update_idletasks()
         width = self.win.winfo_width()
         height = self.win.winfo_height()
+        self.height = height
         vleft, vtop, vwidth, vheight = virtual_screen_rect()
-        x = vleft + vwidth - width - 24
-        y = vtop + vheight - height - 72
-        self.win.geometry(f"+{max(x, vleft)}+{max(y, vtop)}")
+        # 已有浮窗占住的位置要让开，否则连按两次快捷键只会看到一条，另一条被盖住
+        offset = sum(
+            other.height + self.GAP for other in list(_ACTIVE_TOASTS) if other.alive()
+        )
+        x = vleft + vwidth - width - self.MARGIN_RIGHT
+        y = vtop + vheight - height - self.MARGIN_BOTTOM - offset
+        x, y = max(x, vleft), max(y, vtop)
+        # 坑：overrideredirect 之前必须给出**完整**的 "宽x高+X+Y"。
+        # 只给 "+X+Y" 时 Tk 会把位置请求丢掉，窗口停在 (0,0) 左上角。
+        self.win.geometry(f"{width}x{height}+{x}+{y}")
+        self.win.overrideredirect(True)
+        self._x, self._y, self._vtop = x, y, vtop
+        _ACTIVE_TOASTS.append(self)
+
+        # 置顶必须在窗口**映射之后**再做一次：overrideredirect 的窗口如果只在
+        # 创建前设 -topmost，实测会停在普通 z 序里被前台窗口挡住——
+        # 窗口对象存在、IsWindowVisible 也是 True，但屏幕上就是看不见。
+        self._raise_topmost()
+        self._avoid_occlusion()
+        self.win.after(60, self._raise_topmost)
         self.win.after(duration_ms, self.close)
 
+    def _avoid_occlusion(self, attempts: int = 3) -> None:
+        """目标位置被挡住时把浮窗往上抬。
+
+        实测场景：Windows 自己的通知气泡（XAML 岛窗口）弹出后停在右下角，
+        它属于系统的合成层，普通窗口既压不过也挪不动。此时如果硬把浮窗放在
+        固定位置，用户就什么都看不见——等于没提示。
+        这里用 WindowFromPoint 判断自己是不是最上层，不是就往上让。
+        """
+        hwnd = _get_ancestor(int(self.win.winfo_id()), _GA_ROOT)
+        if not hwnd:
+            return
+        for _ in range(attempts):
+            probe_x = self._x + max(self.win.winfo_width() // 2, 8)
+            probe_y = self._y + max(self.height // 2, 8)
+            try:
+                top = _window_from_point(wintypes.POINT(probe_x, probe_y))
+                top_root = _get_ancestor(top, _GA_ROOT) or top
+            except Exception:
+                return
+            if int(top_root or 0) == int(hwnd):
+                return
+
+            rect = wintypes.RECT()
+            try:
+                _get_window_rect(top_root, ctypes.byref(rect))
+            except Exception:
+                return
+            # 抬到遮挡窗口上沿之上，至少让开自己的高度
+            new_y = rect.top - self.height - self.GAP
+            if new_y >= self._y:
+                new_y = self._y - self.height - self.GAP
+            self._y = max(self._vtop, new_y)
+            self._raise_topmost()
+
+    def _raise_topmost(self) -> None:
+        """真正做到窗口置顶，并校正位置。
+
+        两个坑，都只在实测里能发现：
+        1. `overrideredirect(True)` 的窗口上 `wm attributes -topmost` **不生效**
+           ——设完之后 WS_EX_TOPMOST 位仍然是 False，提示框就停在普通 z 序里
+           被前台窗口挡住：窗口在、IsWindowVisible 也是 True，屏幕上看不见。
+        2. override-redirect 之后 Tk 会忽略位置请求，窗口可能停在 (0,0)。
+        所以统一用 SetWindowPos(HWND_TOPMOST) 同时锁住位置和层级。
+        """
+        if not self.alive():
+            return
+        try:
+            self.win.attributes("-topmost", True)
+            self.win.lift()
+        except tk.TclError:
+            return
+        try:
+            hwnd = _get_ancestor(int(self.win.winfo_id()), _GA_ROOT)
+            _set_window_pos(
+                ctypes.c_void_p(int(hwnd) if hwnd else int(self.win.winfo_id())),
+                _HWND_TOPMOST, self._x, self._y,
+                self.win.winfo_width(), self.height,
+                _SWP_NOACTIVATE,
+            )
+        except Exception:
+            # 置顶失败不影响窗口本身，最差退化成普通窗口
+            pass
+
+    def alive(self) -> bool:
+        try:
+            return bool(self.win.winfo_exists())
+        except tk.TclError:
+            return False
+
     def close(self) -> None:
+        if self in _ACTIVE_TOASTS:
+            _ACTIVE_TOASTS.remove(self)
         try:
             self.win.destroy()
         except tk.TclError:

@@ -29,6 +29,23 @@ A lightweight Windows 10 background utility: press a hotkey, read the QR code cu
 
 A toast notification appears on success; on failure you'll see "No QR code found".
 
+## Bottom-right notice: is the app alive?
+
+Every trigger always produces a bottom-right notice. The four titles are distinct,
+so you can tell at a glance what happened:
+
+| Title | Meaning | What to do |
+| --- | --- | --- |
+| `QRClipper 已启动` | The app is up; the message lists the hotkeys actually in effect | Check it matches the keys you pressed |
+| `已复制到剪贴板` | Recognized and copied | Just Ctrl+V |
+| `未识别到二维码` | **The app is fine — it simply found no code** | Follow the hint; use region select for small codes |
+| `识别失败` | A real error (capture/decoding), with the reason | Retry, or run `QRClipper.exe --doctor` |
+
+This notice is drawn by QRClipper itself. It does not depend on Windows notification
+settings or on the tray icon working, so it still appears with `--no-tray` or when the
+tray icon is collapsed. If a system notification happens to sit in the same corner, the
+notice moves up instead of being hidden behind it.
+
 ## Tray menu
 
 Right-click the tray icon:

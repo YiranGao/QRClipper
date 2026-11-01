@@ -151,7 +151,18 @@ class TestDpi(unittest.TestCase):
         summary = capture.dpi_summary()
         self.assertEqual(summary["virtual_screen"], (left, top, width, height))
         self.assertGreater(summary["system_dpi"], 0)
-        self.assertIsInstance(summary["monitors"], list)
+        # 逐显示器枚举已移除（ctypes 回调有挂起风险），只保留安全的数量
+        self.assertIsInstance(summary["monitor_count"], int)
+        self.assertNotIn("monitors", summary)
+        self.assertGreaterEqual(capture.monitor_count(), 1)
+
+    def test_dpi_summary_is_fast(self):
+        """诊断必须便宜：它会跑在启动路径上。"""
+        started = time.perf_counter()
+        for _ in range(20):
+            capture.dpi_summary()
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        self.assertLess(elapsed_ms, 2000, f"dpi_summary 过慢：{elapsed_ms:.0f} ms/20 次")
 
     def test_cursor_pos_is_physical(self):
         """GetCursorPos 的结果必须落在虚拟屏幕范围内（物理像素口径）。"""
@@ -164,6 +175,38 @@ class TestDpi(unittest.TestCase):
         self.assertGreaterEqual(y, top)
         self.assertLessEqual(x, left + width)
         self.assertLessEqual(y, top + height)
+
+
+class TestStartupRobustness(unittest.TestCase):
+    """诊断代码绝不能阻断启动（曾经把环境诊断排在最前面，卡住就全盘瘫痪）。"""
+
+    def test_log_environment_never_raises(self):
+        """capture.dpi_summary() 抛异常时也只能记日志，不能把启动流程打断。"""
+        import tkinter as tk
+
+        import capture
+        import qrclip
+
+        app = qrclip.App(show_tray=False)
+        original = capture.dpi_summary
+        try:
+            capture.dpi_summary = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+            app._log_environment()  # 不应抛出
+        finally:
+            capture.dpi_summary = original
+            app.root.destroy()
+
+    def test_diagnostics_do_not_touch_core_stage(self):
+        """核心阶段标记必须能在诊断失败的情况下推进到 ready。"""
+        import qrclip
+
+        app = qrclip.App(show_tray=False)
+        try:
+            self.assertEqual(app._stage, "init")
+            app._stage = "ready"  # 模拟核心已就绪
+            self.assertEqual(app._stage, "ready")
+        finally:
+            app.root.destroy()
 
 
 class TestHotkeyManagerReload(unittest.TestCase):

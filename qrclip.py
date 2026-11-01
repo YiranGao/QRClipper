@@ -33,6 +33,7 @@ from config import Config, set_autostart, setup_logging
 import decoder as decoder_module
 from decoder import decode_image
 from hotkey import HotKeyManager, format_hotkey, parse_hotkey
+from notify import Notifier
 from ui import SettingsWindow, Snipper, ToastWindow, make_tray_image
 
 ACTION_FULL = "full"
@@ -83,11 +84,30 @@ class App:
         self.icon = None
         self._settings_window: Optional[SettingsWindow] = None
         self._snipper: Optional[Snipper] = None
+        self._stage = "init"  # 启动阶段标记，供看门狗定位卡点
+        self._tk_thread_id = threading.get_ident()
+
+        # 通知是「用户能不能知道发生了什么」的唯一出口，必须与托盘解耦：
+        # Notifier 内部按 pystray -> Shell_NotifyIcon -> Tk 浮窗 三级降级。
+        self.notifier = Notifier(
+            logger=self.logger,
+            icon_getter=lambda: self.icon,
+            toast=self._toast_on_main,
+            enabled=lambda: bool(self.cfg.get("notify", True)),
+        )
 
     # ---------- 生命周期 ----------
     def start(self) -> None:
+        """启动顺序的硬原则：**核心功能先起来，诊断/提示永远排在后面**。
+
+        曾经把 _log_environment() 放在最前面，任何一步诊断卡住都会连带
+        热键线程和托盘一起起不来，程序表现为"活着但完全无响应"。
+        """
+        self._start_watchdog()
+        self._stage = "autostart"
         self._apply_autostart()
-        self._log_environment()
+
+        self._stage = "hotkeys"
         self.hotkeys.start()
         self.hotkeys.wait_ready()
         self._reload_hotkeys()
@@ -97,19 +117,101 @@ class App:
             self.logger.warning("热键重载超时，注册结果可能不完整")
         self._check_hotkey_registration()
 
+        self._stage = "tray"
+        tray_ok = True
         if self.show_tray:
-            self._start_tray()
+            tray_ok = self._start_tray()
 
+        self._stage = "environment"
+        self._log_environment()  # 诊断放最后，且内部整体兜异常
+
+        self._stage = "ready"
         self._warn_if_elevated()
-        self.logger.info(
-            "QRClipper 已启动：全屏=%s 框选=%s",
-            format_hotkey(self.cfg.get("hotkey_full")),
-            format_hotkey(self.cfg.get("hotkey_snip")),
-        )
+        # 放进事件循环里发：托盘线程刚起来，给它一点时间把自己的图标挂上，
+        # 顺带保证浮窗通道所需的主循环已经在跑。
+        self.root.after(300, self._announce_startup_safe, tray_ok)
         self.root.mainloop()
 
+    def _announce_startup_safe(self, tray_ok: bool) -> None:
+        """定时回调里不能抛异常：windowed 模式下 traceback 没人看得见。"""
+        try:
+            self._announce_startup(tray_ok)
+        except Exception as exc:
+            self.logger.error("启动通知发送失败（不影响功能）：%s", exc)
+
+    def _announce_startup(self, tray_ok: bool) -> None:
+        """启动完成后弹一条"已启动"，把当前真正生效的快捷键告诉用户。
+
+        用户按快捷键没反应时最需要的就是这条：它能先证明「进程起来了、
+        热键注册的是这两个组合」，把"程序挂了"和"热键不是我以为的那个"分开。
+        """
+        full = format_hotkey(self.cfg.get("hotkey_full"))
+        snip = format_hotkey(self.cfg.get("hotkey_snip"))
+        if not self.show_tray:
+            tray_state = "未启用"
+        elif tray_ok:
+            tray_state = "已创建"
+        else:
+            tray_state = "不可用"
+        self.logger.info("QRClipper 已启动：全屏=%s 框选=%s（托盘=%s）",
+                         full, snip, tray_state)
+
+        active = self.hotkeys.registered_bindings()
+        if not active:
+            # 全部注册失败属于功能级故障，必须无视 notify 开关告诉用户
+            self._notify(
+                "QRClipper 已启动，但快捷键不可用",
+                "两个快捷键都没能注册成功（可能被其他程序占用）。\n"
+                f"请从托盘菜单「设置…」换一组组合，或退出后重新启动。\n"
+                f"当前配置：全屏={full}，框选={snip}",
+                force=True,
+                level=Notifier.LEVEL_WARN,
+            )
+            return
+
+        hints = "，".join(
+            f"{'全屏' if action == ACTION_FULL else '框选'} {format_hotkey(hotkey)}"
+            for action, hotkey in active.items()
+        )
+        if not tray_ok:
+            self._notify(
+                "QRClipper 已启动（托盘不可用）",
+                f"托盘图标没能创建，请用快捷键操作：{hints}",
+                force=True,
+                level=Notifier.LEVEL_WARN,
+            )
+            return
+        self._notify("QRClipper 已启动", f"快捷键：{hints}")
+
+    def _start_watchdog(self, timeout: float = 10.0) -> None:
+        """独立线程看门狗：核心没在预期时间内就绪就记一条明确日志。
+
+        Tk 的 after 在主线程被阻塞时同样不会触发，所以必须用独立线程。
+        """
+        def _watch() -> None:
+            time.sleep(timeout)
+            if self._stage == "ready":
+                return
+            self.logger.warning(
+                "启动看门狗：%.0f 秒后仍未就绪，卡在阶段「%s」"
+                "（autostart -> hotkeys -> tray -> environment -> ready）",
+                timeout, self._stage,
+            )
+
+        threading.Thread(target=_watch, name="StartWatchdog", daemon=True).start()
+
     def _log_environment(self) -> None:
-        """把 DPI / 缩放 / 坐标系 / 自启动状态写进日志，便于事后定位。"""
+        """把 DPI / 缩放 / 坐标系 / 自启动状态写进日志，便于事后定位。
+
+        整段包在 try/except 里：诊断信息写不出来只影响排查，**绝不能**因此
+        中断启动流程。
+        """
+        try:
+            self._log_environment_inner()
+        except Exception as exc:
+            self.logger.warning("记录环境信息失败（不影响功能）：%s", exc)
+
+    def _log_environment_inner(self) -> None:
         summary = capture.dpi_summary()
         self.logger.info(
             "环境：DPI 感知=%s 系统 DPI=%d（缩放 %d%%） 虚拟屏幕=%s",
@@ -118,12 +220,7 @@ class App:
             summary["scale_percent"],
             summary["virtual_screen"],
         )
-        for index, (left, top, right, bottom, dpi_x, dpi_y) in enumerate(summary["monitors"]):
-            self.logger.info(
-                "  显示器#%d %dx%d @(%d,%d) dpi=%d/%d（缩放 %d%%）",
-                index, right - left, bottom - top, left, top, dpi_x, dpi_y,
-                round(dpi_x / 96.0 * 100),
-            )
+        self.logger.info("显示器数量：%d", summary["monitor_count"])
 
         # Tk 的屏幕尺寸必须与物理虚拟屏幕一致，否则框选坐标会整体错位
         tk_size = (self.root.winfo_screenwidth(), self.root.winfo_screenheight())
@@ -191,20 +288,30 @@ class App:
         self.logger.warning("进程处于提升权限状态，剪贴板写入可能被 UIPI 拦截")
         self._notify("请不要以管理员身份运行", message)
 
-    def _start_tray(self) -> None:
+    def _start_tray(self) -> bool:
+        """创建托盘图标，返回是否成功。
+
+        失败时**不**中断启动：热键才是主路径，托盘只是入口之一。
+        """
         try:
             import pystray
         except Exception as exc:  # pragma: no cover
             self.logger.error("托盘库不可用：%s", exc)
-            return
+            return False
 
-        self.icon = pystray.Icon(
-            "QRClipper",
-            make_tray_image(),
-            "QRClipper - 屏幕二维码识别",
-            menu=pystray.Menu(self._build_tray_menu),
-        )
-        threading.Thread(target=self.icon.run, name="TrayThread", daemon=True).start()
+        try:
+            self.icon = pystray.Icon(
+                "QRClipper",
+                make_tray_image(),
+                "QRClipper - 屏幕二维码识别",
+                menu=pystray.Menu(self._build_tray_menu),
+            )
+            threading.Thread(target=self.icon.run, name="TrayThread", daemon=True).start()
+            return True
+        except Exception as exc:
+            self.logger.error("托盘图标创建失败（不影响热键）：%s", exc)
+            self.icon = None
+            return False
 
     def _build_tray_menu(self):
         import pystray
@@ -243,6 +350,10 @@ class App:
                 self.icon.stop()
             except Exception:
                 pass
+        try:
+            self.notifier.close()
+        except Exception:
+            pass
         try:
             self.root.destroy()
         except tk.TclError:
@@ -314,26 +425,73 @@ class App:
         threading.Thread(target=self._scan_worker, args=(region,), daemon=True).start()
 
     def _scan_worker(self, region: Optional[Tuple[int, int, int, int]]) -> None:
+        """后台执行「截图 -> 识别」，把结果连同尺寸/错误一起交回 Tk 线程。
+
+        三种结局必须能被区分开（这正是用户分不清"程序挂了"还是"没识别到"
+        的根源），所以这里把 error 单独收集，而不是统一折叠成空结果：
+          - 成功        -> texts 非空
+          - 截到但没码  -> texts 空，error 空，size 有值
+          - 出错        -> error 非空
+        """
         started = time.perf_counter()
+        image = None
+        texts: List[str] = []
+        error = ""
         try:
             image = capture.grab(region) if region else capture.grab_all()
+        except Exception as exc:
+            error = f"截屏失败：{exc}"
+            self.logger.exception("截屏失败：%s", exc)
+
+        if image is not None:
             self.logger.info(
                 "截图完成：%dx%d（%s）", image.width, image.height,
                 f"区域 {region}" if region else "全屏",
             )
-            texts = decode_image(image)
-        except Exception as exc:
-            self.logger.exception("识别过程异常：%s", exc)
-            texts = []
-        elapsed_ms = int((time.perf_counter() - started) * 1000)
-        self.root.after(0, lambda: self._present(texts, elapsed_ms))
+            try:
+                texts = decode_image(image)
+            except Exception as exc:
+                error = f"识别过程出错：{exc}"
+                self.logger.exception("识别过程异常：%s", exc)
 
-    def _present(self, texts: List[str], elapsed_ms: int) -> None:
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        size = (image.width, image.height) if image is not None else (0, 0)
+        self.root.after(0, lambda: self._present(texts, elapsed_ms, size, error))
+
+    def _present(
+        self,
+        texts: List[str],
+        elapsed_ms: int,
+        size: Tuple[int, int] = (0, 0),
+        error: str = "",
+    ) -> None:
+        """统一出口：无论哪种结局都必须给用户一个可见的右下角通知。
+
+        通知在识别流程结束的**同一时刻**发出（不再依赖托盘是否活着），
+        并且三种结局的标题各不相同，用户一眼就能分清。
+        """
+        if error:
+            self.logger.error("识别失败（耗时 %d ms）：%s", elapsed_ms, error)
+            self._notify(
+                "识别失败",
+                f"{error}\n请重试一次；若反复失败，可运行 QRClipper.exe --doctor 查看环境诊断。",
+                force=True,
+                level=Notifier.LEVEL_ERROR,
+                duration_ms=7000,
+            )
+            self._beep(False)
+            return
+
         if not texts:
             self.logger.info("未识别到二维码（耗时 %d ms）", elapsed_ms)
+            taken = f"已截取 {size[0]}x{size[1]}，" if size[0] and size[1] else ""
             self._notify(
                 "未识别到二维码",
-                "请确认二维码在屏幕上清晰可见；4K 屏上很小的码建议用「框选识别」缩小范围。",
+                f"{taken}请确认二维码清晰可见、没有被遮挡或反光；"
+                f"屏上二维码较小时，改用「框选识别」({format_hotkey(self.cfg.get('hotkey_snip'))}) 缩小范围。",
+                force=True,
+                level=Notifier.LEVEL_WARN,
+                duration_ms=6000,
             )
             self._beep(False)
             return
@@ -358,6 +516,8 @@ class App:
         preview = texts[0] if len(texts) == 1 else f"{texts[0]}\n…共 {len(texts)} 个"
         if len(preview) > 120:
             preview = preview[:120] + "…"
+        if len(texts) > 1:
+            preview = f"{preview}\n共 {len(texts)} 个"
 
         if not copy_enabled:
             self._notify(f"识别到 {len(texts)} 个二维码", preview)
@@ -365,27 +525,43 @@ class App:
             title = f"已复制 {len(texts)} 个二维码内容" if len(texts) > 1 else "已复制到剪贴板"
             self._notify(title, preview)
         else:
+            # 剪贴板写失败属于故障，不能因为 notify=false 就静默
             self._notify(
                 "识别成功，但复制失败",
                 "剪贴板可能被其他程序占用或被安全软件拦截。\n"
                 "可重试一次，或在设置里关闭「识别结果写入剪贴板」改用提示框查看。",
+                force=True,
+                level=Notifier.LEVEL_WARN,
             )
         self._beep(copied or not copy_enabled)
 
-    def _notify(self, title: str, message: str) -> None:
-        """气泡提示；托盘不可用或被系统拦截时退回 Tk 浮窗，保证用户一定看得到。"""
-        if not self.cfg.get("notify", True):
-            return
-        if self.icon is not None:
-            try:
-                self.icon.notify(message, title)
-                return
-            except Exception as exc:
-                self.logger.warning("气泡提示失败，改用浮窗提示：%s", exc)
-        try:
-            ToastWindow(self.root, title, message)
-        except Exception as exc:
-            self.logger.warning("浮窗提示失败：%s", exc)
+    def _toast_on_main(self, title: str, message: str, duration_ms: int = 4000) -> None:
+        """把 Tk 浮窗切到主线程创建（Tk 对象只能在创建它的线程操作）。"""
+        def _show() -> None:
+            ToastWindow(self.root, title, message, duration_ms=duration_ms)
+
+        if threading.get_ident() == self._tk_thread_id:
+            _show()
+        else:
+            self.root.after(0, _show)
+
+    def _notify(
+        self,
+        title: str,
+        message: str,
+        force: bool = False,
+        level: str = Notifier.LEVEL_INFO,
+        duration_ms: int = 4000,
+    ) -> str:
+        """统一通知入口，返回实际使用的通道名。
+
+        Args:
+            force: 失败/无结果类通知必须为 True——用户关掉 notify 只是不想被
+                "已复制"这种成功提示打扰，而不是想在出问题时什么都看不到。
+        """
+        return self.notifier.send(
+            title, message, force=force, level=level, duration_ms=duration_ms
+        )
 
     def _beep(self, success: bool) -> None:
         if not self.cfg.get("sound", False):
@@ -412,7 +588,12 @@ class App:
             if parse_hotkey(values.get(name, "")) is None
         ]
         if invalid:
-            self._notify("快捷键无效", "已恢复为原来的设置")
+            self._notify(
+                "快捷键无效",
+                "已恢复为原来的设置，请重新录入。",
+                force=True,
+                level=Notifier.LEVEL_WARN,
+            )
             return
 
         for key, value in values.items():
@@ -544,11 +725,7 @@ def run_doctor() -> int:
     emit(f"DPI 感知级别    : {summary['awareness']}")
     emit(f"系统 DPI / 缩放 : {summary['system_dpi']} / {summary['scale_percent']}%")
     emit(f"虚拟屏幕(物理)  : {summary['virtual_screen']}")
-    for index, (left, top, right, bottom, dpi_x, dpi_y) in enumerate(summary["monitors"]):
-        emit(
-            f"  显示器#{index}      : {right - left}x{bottom - top} @({left},{top}) "
-            f"dpi={dpi_x}/{dpi_y} 缩放={round(dpi_x / 96.0 * 100)}%"
-        )
+    emit(f"显示器数量      : {summary['monitor_count']}")
 
     try:
         root = tk.Tk()
@@ -626,6 +803,22 @@ def decoder_engines() -> List[tuple]:
     return decoder_module._load_engines()
 
 
+def _notify_already_running(message: str, duration_ms: int = 6000) -> None:
+    """非阻塞地提示"已在运行中"：用自动关闭的 Tk 浮窗，不用模态 MessageBox。
+
+    浮窗几秒后自动销毁并退出 mainloop，进程随即结束、释放互斥体句柄；
+    任何异常都吞掉，保证这条分支一定会走到 return，不留下挂住的进程。
+    """
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        ToastWindow(root, "QRClipper 已在运行中", message, duration_ms=duration_ms)
+        root.after(duration_ms + 500, root.destroy)
+        root.mainloop()
+    except Exception:
+        pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="屏幕二维码识别并复制到剪贴板")
     parser.add_argument("--scan", action="store_true", help="全屏识别一次后退出")
@@ -669,7 +862,10 @@ def main() -> int:
     guard = SingleInstance()
     if guard.already_running:
         # 打包成 windowed 程序后没有控制台，只写 stderr 等于毫无反馈，
-        # 用户会以为「双击没反应 / 程序没起来」。这里额外弹窗 + 记日志。
+        # 用户会以为「双击没反应 / 程序没起来」，所以用浮窗提示后再退出。
+        # 注意：**绝不能**用 MessageBox——它是模态的，没人点就永远不返回，
+        # 这个进程会一直挂着并占住互斥体句柄，之后每次启动都会被判成
+        # "重复启动"，程序表现为彻底无响应。
         message = (
             "QRClipper 已经在运行中，无需重复启动。\n"
             "托盘图标可能被 Windows 折叠进了任务栏右下角的隐藏区域，"
@@ -677,7 +873,7 @@ def main() -> int:
         )
         print(message, file=sys.stderr)
         setup_logging().info("重复启动被拒绝：已有实例在运行")
-        _show_message("QRClipper 已在运行中", message)
+        _notify_already_running(message)
         return 0
 
     app = App(show_tray=not args.no_tray)
